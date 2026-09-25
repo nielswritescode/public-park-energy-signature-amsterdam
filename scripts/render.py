@@ -13,7 +13,8 @@ import pickle
 import time
 
 import numpy as np
-from shapely.geometry import Polygon
+import shapely
+from shapely.geometry import Polygon, box
 from PIL import Image, ImageDraw, ImageFilter, ImageFont
 
 import style as st
@@ -31,8 +32,8 @@ class PolySet:
     """Polygons exploded into (exterior, holes) rings with bounds for culling."""
 
     def __init__(self, recs):
-        self.ext, self.holes, self.names, self.area = [], [], [], []
-        for g, name in recs:
+        self.ext, self.holes, self.names, self.area, self.feat = [], [], [], [], []
+        for fi, (g, name) in enumerate(recs):
             for p in getattr(g, "geoms", [g]):
                 if p.geom_type != "Polygon" or p.is_empty:
                     continue
@@ -40,6 +41,7 @@ class PolySet:
                 self.holes.append([np.asarray(r.coords) for r in p.interiors])
                 self.names.append(name)
                 self.area.append(p.area)
+                self.feat.append(fi)
         self.bounds = np.array([[*e.min(0), *e.max(0)] for e in self.ext]).reshape(-1, 4)
 
     def within(self, win):
@@ -60,15 +62,51 @@ class LineSet:
         return np.nonzero((b[:, 2] >= xa) & (b[:, 0] <= xb) & (b[:, 3] >= ya) & (b[:, 1] <= yb))[0]
 
 
-def load_features(min_park_area):
+MAP_SQUARE = box(-RADIUS_M, -RADIUS_M, RADIUS_M, RADIUS_M)
+NEIGHBOUR_M = 250  # parks closer than this get different colours
+
+
+def assign_colours(feats, n_legend):
+    """Give every park a palette index; the largest named parks get unique ones.
+
+    feats: [(geometry, name)]. Returns (index per feature, legend rows). The legend
+    parks are the n_legend largest named parks *inside the map*. Every other park
+    takes the palette colour that is unused nearby and least used overall, so
+    neighbouring parks always look different.
+    """
+    n_col = st.PALETTE_SIZE
+    inside = [g.intersection(MAP_SQUARE).area for g, _ in feats]
+    order = sorted(range(len(feats)), key=lambda i: -inside[i])
+    legend_ids = [i for i in order if feats[i][1] and inside[i] > 0][:n_legend]
+    colour = {i: k for k, i in enumerate(legend_ids)}
+    used = [0] * n_col
+    for c in colour.values():
+        used[c] += 1
+    tree = shapely.STRtree([g for g, _ in feats])
+    for i in order:
+        if i in colour:
+            continue
+        near = tree.query(feats[i][0], predicate="dwithin", distance=NEIGHBOUR_M)
+        taken = {colour[j] for j in near if j in colour}
+        free = [c for c in range(n_col) if c not in taken] or list(range(n_col))
+        colour[i] = min(free, key=lambda c: (used[c], c))
+        used[colour[i]] += 1
+    legend = [(feats[i][1], colour[i], inside[i] / 1e4) for i in legend_ids]
+    return [colour[i] for i in range(len(feats))], legend
+
+
+def load_features(min_park_area, n_legend):
     with open(FEATURES, "rb") as fh:
         d = pickle.load(fh)
     polys = {k: PolySet(v) for k, v in d["polys"].items()}
     lines = {k: LineSet(v) for k, v in d["lines"].items()}
     kept = [(g, n) for g, n in d["parks"] if g.area >= min_park_area]
     parks = PolySet(kept)
-    print(f"public parks: {len(d['parks'])} in OSM, {len(kept)} drawn (>= {min_park_area:.0f} m2)")
-    return polys, lines, parks, d["places"]
+    colours, legend = assign_colours(kept, n_legend)
+    parks.colour = [colours[f] for f in parks.feat]
+    print(f"public parks: {len(d['parks'])} in OSM, {len(kept)} drawn (>= {min_park_area:.0f} m2), "
+          f"{len(set(colours))} outline colours, {len(legend)} in the legend")
+    return polys, lines, parks, d["places"], legend
 
 
 # --- drawing helpers -------------------------------------------------------------
@@ -204,46 +242,64 @@ def render_tile(view, polys, lines, parks, res):
     paint(2, True)
     paint(2, False)
 
-    # 5. neon outline mask for public parks
-    mask = Image.new("L", (W, H), 0)
-    md = ImageDraw.Draw(mask)
-    hot = Image.new("L", (W, H), 0)
-    hd = ImageDraw.Draw(hot)
+    # 5. neon outlines for public parks, each in its own colour
+    neon = NeonLayer(W, H)
     lw = max(1.0, st.NEON_LINE_W * k) * SS
     hw = max(1.0, st.NEON_HOT_W * k) * SS
     for i in parks.within(win):
-        pts = view.px(parks.ext[i])
-        pts = np.vstack([pts, pts[:1]])
-        md.line(flat(pts), fill=255, width=round(lw), joint="curve")
-        hd.line(flat(pts), fill=255, width=round(hw), joint="curve")
+        neon.outline(view.px(parks.ext[i]), st.NEON_PALETTE[parks.colour[i]], lw, hw)
 
     out = img.resize((view.w, view.h), Image.LANCZOS)
-    m = mask.resize((view.w, view.h), Image.LANCZOS)
-    h = hot.resize((view.w, view.h), Image.LANCZOS)
-    return neon(out, m, h, k)
+    return neon.composite(out, k, SS)
 
 
-def neon(base, mask, hot, k):
-    """Composite the glowing outline over the base map."""
-    if not mask.getbbox():
-        return base
-    arr = np.asarray(base, dtype=np.float32) / 255.0
-    neon_c = np.array(st.NEON, dtype=np.float32) / 255.0
-    hot_c = np.array(st.NEON_HOT, dtype=np.float32) / 255.0
-    line_w = max(1.0, st.NEON_LINE_W * k)
+class NeonLayer:
+    """Glowing coloured outlines.
 
-    def over(a, colour, alpha):
-        alpha = alpha[..., None]
-        return a * (1 - alpha) + colour * alpha
+    Colours are kept premultiplied (colour x coverage) so that blurring them blends
+    neighbouring glows of different colours instead of smearing them to grey.
+    """
 
-    for sigma, target in st.NEON_HALOS:
-        s = max(0.8, sigma * k)
-        blurred = np.asarray(mask.filter(ImageFilter.GaussianBlur(s)), dtype=np.float32) / 255.0
-        peak = line_w / (math.sqrt(2 * math.pi) * s)
-        arr = over(arr, neon_c, np.clip(blurred / peak * target, 0, 0.92))
-    arr = over(arr, neon_c, np.asarray(mask, dtype=np.float32) / 255.0)
-    arr = over(arr, hot_c, np.asarray(hot, dtype=np.float32) / 255.0)
-    return Image.fromarray((np.clip(arr, 0, 1) * 255 + 0.5).astype(np.uint8), "RGB")
+    def __init__(self, w, h):
+        self.core = (Image.new("RGB", (w, h)), Image.new("L", (w, h)))  # line colour, coverage
+        self.hot = (Image.new("RGB", (w, h)), Image.new("L", (w, h)))  # bright inner line
+        self.draw = [ImageDraw.Draw(im) for im in (*self.core, *self.hot)]
+
+    def outline(self, ring, rgb, line_w, hot_w):
+        pts = flat(np.vstack([ring, ring[:1]]))
+        lw, hw = round(line_w), round(hot_w)
+        self.draw[0].line(pts, fill=rgb, width=lw, joint="curve")
+        self.draw[1].line(pts, fill=255, width=lw, joint="curve")
+        self.draw[2].line(pts, fill=st.neon_hot(rgb), width=hw, joint="curve")
+        self.draw[3].line(pts, fill=255, width=hw, joint="curve")
+
+    def composite(self, base, k, ss):
+        """Glow halos, then the line, then the hot core, over `base` (final resolution)."""
+        if not self.core[1].getbbox():
+            return base
+        shrink = (lambda im: im.reduce(ss)) if ss > 1 else (lambda im: im)
+        (col, cov), (hcol, hcov) = ((shrink(a), shrink(b)) for a, b in (self.core, self.hot))
+        arr = np.asarray(base, dtype=np.float32) / 255.0
+        line_w = max(1.0, st.NEON_LINE_W * k)
+
+        def unit(im):
+            return np.asarray(im, dtype=np.float32) / 255.0
+
+        def over(a, colour, alpha):
+            return a * (1 - alpha[..., None]) + colour * alpha[..., None]
+
+        def colour_of(premul, coverage):
+            return np.clip(premul / np.maximum(coverage, 1e-3)[..., None], 0, 1)
+
+        for sigma, target in st.NEON_HALOS:
+            s = max(0.8, sigma * k)
+            cb = unit(cov.filter(ImageFilter.GaussianBlur(s)))
+            pb = unit(col.filter(ImageFilter.GaussianBlur(s)))
+            peak = line_w / (math.sqrt(2 * math.pi) * s)
+            arr = over(arr, colour_of(pb, cb), np.clip(cb / peak * target, 0, 0.92))
+        arr = over(arr, colour_of(unit(col), unit(cov)), unit(cov))
+        arr = over(arr, colour_of(unit(hcol), unit(hcov)), unit(hcov))
+        return Image.fromarray((np.clip(arr, 0, 1) * 255 + 0.5).astype(np.uint8), "RGB")
 
 
 # --- labels, scale bar, attribution ---------------------------------------------
@@ -328,11 +384,14 @@ def main():
     ap.add_argument("--out", default=str(ROOT / "assets" / "amsterdam-map.jpg"))
     ap.add_argument("--preview", type=int, default=2000, help="README preview width in px (0 = skip)")
     ap.add_argument("--min-park-area", type=float, default=MIN_PARK_AREA_M2)
+    ap.add_argument("--legend-parks", type=int, default=st.PALETTE_SIZE,
+                    help="how many of the largest named parks the legend lists")
+    ap.add_argument("--reset-legend", action="store_true", help="regenerate legend.md (overwrites your edits)")
     ap.add_argument("--crop", help="cx,cy,half in metres from the centre: render just that window (for tuning)")
     a = ap.parse_args()
 
     t0 = time.time()
-    polys, lines, parks, places = load_features(a.min_park_area)
+    polys, lines, parks, places, legend = load_features(a.min_park_area, a.legend_parks)
     print(f"features loaded in {time.time() - t0:.0f}s")
 
     if a.crop:
@@ -372,7 +431,7 @@ def main():
         save(full.resize((a.preview, a.preview), Image.LANCZOS), pout)
         print(f"saved {pout} ({os.path.getsize(pout) / 1e6:.1f} MB)")
     import legend_assets
-    legend_assets.make()
+    legend_assets.make(legend, reset=a.reset_legend)
     print(f"total {time.time() - t0:.0f}s")
 
 

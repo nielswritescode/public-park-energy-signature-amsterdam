@@ -10,9 +10,51 @@ REF_RES = 2.5
 LAND = (242, 239, 233)
 WATER = (170, 211, 223)
 
-# Public parks get this neon outline + glow; nothing else on the map is this colour.
-NEON = (255, 30, 230)
-NEON_HOT = (255, 214, 250)  # the bright "tube" core of the outline
+# Public parks get a neon outline + glow, each park in its own colour. Nothing else on
+# the map is this saturated. Colours are generated in OKLCH (constant lightness, so none
+# looks weaker than another on the pale map) and spaced by the golden angle so that
+# consecutive colours are far apart in hue.
+PALETTE_SIZE = 30
+
+
+def _oklch_to_srgb(L, C, h_deg):
+    """OKLCH -> 8-bit sRGB, reducing chroma until the colour fits the sRGB gamut."""
+    import math
+
+    def convert(c):
+        a, b = c * math.cos(math.radians(h_deg)), c * math.sin(math.radians(h_deg))
+        l = (L + 0.3963377774 * a + 0.2158037573 * b) ** 3
+        m = (L - 0.1055613458 * a - 0.0638541728 * b) ** 3
+        s = (L - 0.0894841775 * a - 1.2914855480 * b) ** 3
+        return (4.0767416621 * l - 3.3077115913 * m + 0.2309699292 * s,
+                -1.2684380046 * l + 2.6097574011 * m - 0.3413193965 * s,
+                -0.0041960863 * l - 0.7034186147 * m + 1.7076147010 * s)
+
+    lo, hi = 0.0, C
+    for _ in range(24):
+        mid = (lo + hi) / 2
+        if all(-1e-6 <= v <= 1 + 1e-6 for v in convert(mid)):
+            lo = mid
+        else:
+            hi = mid
+    gamma = lambda v: 12.92 * v if v <= 0.0031308 else 1.055 * max(v, 0) ** (1 / 2.4) - 0.055
+    return tuple(round(min(1, max(0, gamma(v))) * 255) for v in convert(lo))
+
+
+def neon_palette(n, lightness=(0.66, 0.75)):
+    """Hues skip 80-130 degrees: yellow-greens only look olive at this lightness, not neon."""
+    def hue(k):
+        return 130.0 + ((k * 137.508 + 200.0) % 360.0) * (310.0 / 360.0)
+
+    return [_oklch_to_srgb(lightness[k % 2], 0.33, hue(k) % 360) for k in range(n)]
+
+
+def neon_hot(rgb):
+    """The bright 'tube' core of an outline: the colour pushed towards white."""
+    return tuple(round(c + (255 - c) * 0.8) for c in rgb)
+
+
+NEON_PALETTE = neon_palette(PALETTE_SIZE)
 
 # Filled areas, in draw order (bottom to top). (fill, outline or None)
 AREAS = [
